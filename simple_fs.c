@@ -10,12 +10,21 @@
 #include <sys/time.h>
 #include <time.h>
 #include <libgen.h>
+#include <stdbool.h>
+
+struct file_version {
+    size_t version_number;
+    char *content;
+    size_t size;
+    struct timespec timestamp;
+    struct file_version *next;
+};
 
 // Structure representing a file or directory
 struct file_node {
     char *name;
-    char *content;
-    size_t size;
+    char *content;           // Latest content
+    size_t size;             // Latest size
     mode_t mode;
     uid_t uid;
     gid_t gid;
@@ -25,6 +34,10 @@ struct file_node {
     struct file_node *next;
     int is_directory;
     struct file_node *children;
+
+    // Versioning fields
+    size_t current_version;
+    struct file_version *versions;  // Linked list of versions
 };
 
 // Root node of the filesystem
@@ -53,7 +66,19 @@ static void initialize_root() {
     root->is_directory = 1;
     root->children = NULL;
     root->next = NULL;
+    root->current_version = 0;
+    root->versions = NULL;
     printf("Initialized root directory.\n");
+}
+
+// Function to free version list
+void free_version_list(struct file_version *ver) {
+    while (ver) {
+        struct file_version *next_ver = ver->next;
+        free(ver->content);
+        free(ver);
+        ver = next_ver;
+    }
 }
 
 // Function to free nodes recursively
@@ -67,6 +92,8 @@ static void free_node(struct file_node *node) {
         free_node(child);
         child = next_child;
     }
+    // Free the node's versions
+    free_version_list(node->versions);
     // Free the node's name and content
     free(node->name);
     free(node->content);
@@ -100,15 +127,22 @@ static struct file_node* find_node(const char *path) {
         printf("Path is root.\n");
         return root;
     }
-    struct file_node *current = root;
+
     char *path_copy = strdup(path);
     if (!path_copy) {
         perror("strdup");
         return NULL;
     }
 
+    // Versioning Logic: Remove version specifier if present
+    char *version_sep = strchr(path_copy, '@');
+    if (version_sep) {
+        *version_sep = '\0';  // Terminate the path before '@'
+    }
+
     trim_slashes(path_copy);
 
+    struct file_node *current = root;
     char *token = strtok(path_copy, "/");
     while (token != NULL && current != NULL) {
         printf("Looking for token: %s\n", token);
@@ -139,11 +173,50 @@ static int simple_getattr(const char *path, struct stat *stbuf,
     printf("getattr called for path: %s\n", path);
     (void) fi;
     memset(stbuf, 0, sizeof(struct stat));
-    struct file_node *node = find_node(path);
+
+    // Versioning Logic
+    char *versioned_path = strdup(path);
+    if (!versioned_path) {
+        perror("strdup");
+        return -ENOMEM;
+    }
+    char *version_str = strchr(versioned_path, '@');
+    size_t version_number = (size_t)-1;
+    if (version_str) {
+        *version_str = '\0';
+        version_str++;
+        version_number = strtoul(version_str, NULL, 10);
+    }
+    struct file_node *node = find_node(versioned_path);
+    free(versioned_path);
+
     if (node == NULL) {
         printf("getattr: No such file or directory: %s\n", path);
         return -ENOENT;
     }
+
+    if (version_number != (size_t)-1) {
+        // Get attributes for a specific version
+        struct file_version *ver = node->versions;
+        while (ver) {
+            if (ver->version_number == version_number) {
+                stbuf->st_mode = node->mode;
+                stbuf->st_nlink = node->is_directory ? 2 : 1;
+                stbuf->st_size = ver->size;
+                stbuf->st_uid = node->uid;
+                stbuf->st_gid = node->gid;
+                stbuf->st_atim = node->atime;
+                stbuf->st_mtim = ver->timestamp;
+                stbuf->st_ctim = node->ctime;
+                printf("getattr: path %s@%zu, mode %o, size %zu\n", path, version_number, node->mode, ver->size);
+                return 0;
+            }
+            ver = ver->next;
+        }
+        printf("getattr: Version %zu not found for %s\n", version_number, node->name);
+        return -ENOENT;
+    }
+
     stbuf->st_mode = node->mode;
     stbuf->st_nlink = node->is_directory ? 2 : 1;
     stbuf->st_size = node->size;
@@ -520,7 +593,23 @@ static int simple_read(const char *path, char *buf, size_t size, off_t offset,
                        struct fuse_file_info *fi) {
     printf("read called for path: %s, size: %zu, offset: %ld\n", path, size, offset);
     (void) fi;
-    struct file_node *node = find_node(path);
+
+    // Versioning Logic
+    char *versioned_path = strdup(path);
+    if (!versioned_path) {
+        perror("strdup");
+        return -ENOMEM;
+    }
+    char *version_str = strchr(versioned_path, '@');
+    size_t version_number = (size_t)-1;  // Default to latest
+    if (version_str) {
+        *version_str = '\0';  // Terminate the path at '@'
+        version_str++;        // Move to the version number
+        version_number = strtoul(version_str, NULL, 10);
+    }
+
+    struct file_node *node = find_node(versioned_path);
+    free(versioned_path);
     if (node == NULL) {
         printf("read: No such file: %s\n", path);
         return -ENOENT;
@@ -529,13 +618,39 @@ static int simple_read(const char *path, char *buf, size_t size, off_t offset,
         printf("read: Attempted to read a directory: %s\n", path);
         return -EISDIR;
     }
-    if (node->content == NULL) {
+
+    const char *data = NULL;
+    size_t data_size = 0;
+
+    if (version_number != (size_t)-1) {
+        // Read specific version
+        struct file_version *ver = node->versions;
+        while (ver) {
+            if (ver->version_number == version_number) {
+                data = ver->content;
+                data_size = ver->size;
+                printf("read: Reading version %zu of %s\n", version_number, node->name);
+                break;
+            }
+            ver = ver->next;
+        }
+        if (!data) {
+            printf("read: Version %zu not found for %s\n", version_number, node->name);
+            return -ENOENT;
+        }
+    } else {
+        // Read latest version
+        data = node->content;
+        data_size = node->size;
+    }
+
+    if (data == NULL) {
         // No content to read
         size = 0;
-    } else if (offset < node->size) {
-        if (offset + size > node->size)
-            size = node->size - offset;
-        memcpy(buf, node->content + offset, size);
+    } else if (offset < data_size) {
+        if (offset + size > data_size)
+            size = data_size - offset;
+        memcpy(buf, data + offset, size);
     } else {
         size = 0;
     }
@@ -558,6 +673,33 @@ static int simple_write(const char *path, const char *buf, size_t size,
         printf("write: Attempted to write to a directory: %s\n", path);
         return -EISDIR;
     }
+
+    // Versioning Logic
+    // Save current content as a new version before modifying
+    struct file_version *new_version = malloc(sizeof(struct file_version));
+    if (!new_version) {
+        perror("malloc");
+        return -ENOMEM;
+    }
+    new_version->version_number = node->current_version++;
+    new_version->timestamp = node->mtime;  // Use current modification time
+    new_version->size = node->size;
+    if (node->content && node->size > 0) {
+        new_version->content = malloc(node->size);
+        if (!new_version->content) {
+            perror("malloc");
+            free(new_version);
+            return -ENOMEM;
+        }
+        memcpy(new_version->content, node->content, node->size);
+    } else {
+        new_version->content = NULL;
+    }
+    new_version->next = node->versions;
+    node->versions = new_version;
+    printf("write: Saved version %zu of %s\n", new_version->version_number, path);
+
+    // Adjust content size and reallocate if necessary
     if (offset + size > node->size) {
         char *new_content = realloc(node->content, offset + size);
         if (!new_content) {
@@ -573,8 +715,27 @@ static int simple_write(const char *path, const char *buf, size_t size,
     memcpy(node->content + offset, buf, size);
     clock_gettime(CLOCK_REALTIME, &node->mtime);
     printf("write: Wrote %zu bytes to %s at offset %ld\n", size, path, offset);
+
+    // Optional: Keep only the last 5 versions
+    struct file_version *ver = node->versions;
+    int count = 0;
+    while (ver) {
+        count++;
+        if (count > 5) {
+            // Remove older versions
+            struct file_version *to_delete = ver->next;
+            if (to_delete) {
+                ver->next = NULL;
+                free_version_list(to_delete);
+            }
+            break;
+        }
+        ver = ver->next;
+    }
+
     return size;
 }
+
 
 // truncate callback
 static int simple_truncate(const char *path, off_t size,
