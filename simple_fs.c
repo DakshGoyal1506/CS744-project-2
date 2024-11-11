@@ -67,6 +67,8 @@ static size_t snapshot_counter = 0;              // Snapshot ID counter
 // Function prototypes
 static bool is_special_file(const char *path);
 static bool is_snapshots_dir(const char *path);
+static bool is_rollback_file(const char *path);
+static bool is_diff_file(const char *path);
 void create_snapshot();
 void record_file_versions(struct file_node *node, const char *path_prefix, struct snapshot *snap);
 void free_snapshots();
@@ -76,9 +78,12 @@ static void free_node(struct file_node *node);
 static void destroy_fs(void *private_data);
 static void trim_slashes(char *path);
 static struct file_node* find_node(const char *path);
+void rollback_to_snapshot(size_t snapshot_id);
+void restore_file_version(struct file_node *node, size_t version_number);
+char* generate_diff(size_t snapshot_id1, size_t snapshot_id2);
 
-// Helper function to check if a path is the special .snapshot file
-static bool is_special_file(const char *path) {
+// Helper function to check if a path is the snapshot creation file
+static bool is_snapshot_create_file(const char *path) {
     // Normalize path to remove trailing slashes
     size_t len = strlen(path);
     while (len > 1 && path[len - 1] == '/') {
@@ -88,10 +93,28 @@ static bool is_special_file(const char *path) {
     strncpy(normalized_path, path, len);
     normalized_path[len] = '\0';
 
-    return strcmp(normalized_path, "/.snapshot") == 0;
+    return strcmp(normalized_path, "/.snapshot_create") == 0;
 }
 
-// Helper function to check if a path is the .snapshots directory
+// Update is_special_file to include .snapshot_create instead of .snapshot
+static bool is_special_file(const char *path) {
+    return is_snapshot_create_file(path) || is_rollback_file(path) || is_diff_file(path);
+}
+
+// // Helper functions to check special files // old function was used to check .snapshot
+// static bool is_special_file(const char *path) {
+//     // Normalize path to remove trailing slashes
+//     size_t len = strlen(path);
+//     while (len > 1 && path[len - 1] == '/') {
+//         len--;
+//     }
+//     char normalized_path[len + 1];
+//     strncpy(normalized_path, path, len);
+//     normalized_path[len] = '\0';
+
+//     return strcmp(normalized_path, "/.snapshot") == 0;
+// }
+
 static bool is_snapshots_dir(const char *path) {
     // Normalize path to remove trailing slashes
     size_t len = strlen(path);
@@ -105,32 +128,120 @@ static bool is_snapshots_dir(const char *path) {
     return strcmp(normalized_path, "/.snapshots") == 0;
 }
 
+static bool is_rollback_file(const char *path) {
+    size_t len = strlen(path);
+    while (len > 1 && path[len -1] == '/') {
+        len--;
+    }
+    char normalized_path[len +1];
+    strncpy(normalized_path, path, len);
+    normalized_path[len] = '\0';
+
+    return strcmp(normalized_path, "/.rollback") == 0;
+}
+
+static bool is_diff_file(const char *path) {
+    size_t len = strlen(path);
+    while (len > 1 && path[len -1] == '/') {
+        len--;
+    }
+    char normalized_path[len +1];
+    strncpy(normalized_path, path, len);
+    normalized_path[len] = '\0';
+
+    return strcmp(normalized_path, "/.diff") == 0;
+}
+
 // Initialize the root node of the filesystem
 static void initialize_root() {
-    root = malloc(sizeof(struct file_node));
-    if (!root) {
+    if (root == NULL) {
+        root = malloc(sizeof(struct file_node));
+        if (!root) {
+            perror("malloc");
+            exit(EXIT_FAILURE);
+        }
+        memset(root, 0, sizeof(struct file_node));
+        root->name = strdup("");  // Root has an empty name
+        if (!root->name) {
+            perror("strdup");
+            free(root);
+            exit(EXIT_FAILURE);
+        }
+        root->mode = S_IFDIR | 0755;
+        root->uid = getuid();
+        root->gid = getgid();
+        clock_gettime(CLOCK_REALTIME, &root->atime);
+        root->mtime = root->atime;
+        root->ctime = root->atime;
+        root->is_directory = 1;
+        root->children = NULL;
+        root->next = NULL;
+        root->current_version = 0;
+        root->versions = NULL;
+        printf("Initialized root directory.\n");
+    } else {
+        // If root already exists, reset its properties
+        root->children = NULL;
+        root->current_version = 0;
+        root->versions = NULL;
+        free(root->content);
+        root->content = NULL;
+        root->size = 0;
+        clock_gettime(CLOCK_REALTIME, &root->atime);
+        root->mtime = root->atime;
+        root->ctime = root->atime;
+        printf("Re-initialized root directory.\n");
+    }
+
+    // Create .snapshots directory directly under root
+    struct file_node *snapshots_dir = malloc(sizeof(struct file_node));
+    if (!snapshots_dir) {
         perror("malloc");
         exit(EXIT_FAILURE);
     }
-    memset(root, 0, sizeof(struct file_node));
-    root->name = strdup("");  // Root has an empty name
-    if (!root->name) {
+    memset(snapshots_dir, 0, sizeof(struct file_node));
+    snapshots_dir->name = strdup(".snapshots");
+    if (!snapshots_dir->name) {
         perror("strdup");
-        free(root);
+        free(snapshots_dir);
         exit(EXIT_FAILURE);
     }
-    root->mode = S_IFDIR | 0755;
-    root->uid = getuid();
-    root->gid = getgid();
-    clock_gettime(CLOCK_REALTIME, &root->atime);
-    root->mtime = root->atime;
-    root->ctime = root->atime;
-    root->is_directory = 1;
-    root->children = NULL;
-    root->next = NULL;
-    root->current_version = 0;
-    root->versions = NULL;
-    printf("Initialized root directory.\n");
+    snapshots_dir->mode = S_IFDIR | 0755;
+    snapshots_dir->uid = getuid();
+    snapshots_dir->gid = getgid();
+    clock_gettime(CLOCK_REALTIME, &snapshots_dir->atime);
+    snapshots_dir->mtime = snapshots_dir->atime;
+    snapshots_dir->ctime = snapshots_dir->atime;
+    snapshots_dir->is_directory = 1;
+    snapshots_dir->children = NULL;
+    snapshots_dir->next = root->children;
+    root->children = snapshots_dir;
+    printf("Created .snapshots directory.\n");
+
+    // Create .diffs directory directly under root
+    struct file_node *diffs_dir = malloc(sizeof(struct file_node));
+    if (!diffs_dir) {
+        perror("malloc");
+        exit(EXIT_FAILURE);
+    }
+    memset(diffs_dir, 0, sizeof(struct file_node));
+    diffs_dir->name = strdup(".diffs");
+    if (!diffs_dir->name) {
+        perror("strdup");
+        free(diffs_dir);
+        exit(EXIT_FAILURE);
+    }
+    diffs_dir->mode = S_IFDIR | 0755;
+    diffs_dir->uid = getuid();
+    diffs_dir->gid = getgid();
+    clock_gettime(CLOCK_REALTIME, &diffs_dir->atime);
+    diffs_dir->mtime = diffs_dir->atime;
+    diffs_dir->ctime = diffs_dir->atime;
+    diffs_dir->is_directory = 1;
+    diffs_dir->children = NULL;
+    diffs_dir->next = root->children;
+    root->children = diffs_dir;
+    printf("Created .diffs directory.\n");
 }
 
 // Free the list of file versions
@@ -157,9 +268,19 @@ static void free_node(struct file_node *node) {
     // Free the node's versions
     free_version_list(node->versions);
     // Free the node's name and content
-    free(node->name);
-    free(node->content);
-    free(node);
+    if (node != root) {
+        free(node->name);
+        free(node->content);
+        free(node);
+    } else {
+        // For root, reset properties but don't free
+        free(node->content);
+        node->content = NULL;
+        node->size = 0;
+        node->children = NULL;
+        node->versions = NULL;
+        node->current_version = 0;
+    }
 }
 
 // Free all snapshots and their associated data
@@ -178,6 +299,8 @@ void free_snapshots() {
         free(snap);
         snap = next_snap;
     }
+    snapshots_list = NULL;
+    snapshot_counter = 0;
 }
 
 // Cleanup function called on filesystem unmount
@@ -186,6 +309,9 @@ static void destroy_fs(void *private_data) {
     printf("Unmounting filesystem. Cleaning up memory.\n");
     free_snapshots();
     free_node(root);
+    free(root->name);
+    free(root);
+    root = NULL;
 }
 
 // Trim leading and trailing slashes from a path
@@ -274,11 +400,16 @@ void create_snapshot() {
 // Recursively record file versions for a snapshot
 void record_file_versions(struct file_node *node, const char *path_prefix,
                           struct snapshot *snap) {
-    if (node == NULL) return;
+    if (node == NULL)
+        return;
 
     char *current_path = NULL;
     if (strcmp(path_prefix, "") == 0) {
-        asprintf(&current_path, "/%s", node->name);
+        // Avoid double slashes by omitting the first slash if root's name is empty
+        asprintf(&current_path, "/%s", node->name[0] ? node->name : "");
+    } else if (strcmp(node->name, "") == 0) {
+        // Handle root or unnamed nodes
+        asprintf(&current_path, "%s", path_prefix);
     } else {
         asprintf(&current_path, "%s/%s", path_prefix, node->name);
     }
@@ -297,10 +428,10 @@ void record_file_versions(struct file_node *node, const char *path_prefix,
             return;
         }
         fsnap->path = strdup(current_path);
-        fsnap->version_number = node->current_version;
+        fsnap->version_number = node->current_version - 1;
         fsnap->next = snap->file_snapshots;
         snap->file_snapshots = fsnap;
-        printf("record_file_versions: Recorded %s at version %zu\n",
+        printf("record_file_versions: Recorded %s@%zu\n",
                fsnap->path, fsnap->version_number);
     }
 
@@ -314,7 +445,7 @@ void record_file_versions(struct file_node *node, const char *path_prefix,
     }
 
     free(current_path);
-}
+}s
 
 // Prepare a string containing snapshot details
 char* prepare_snapshot_details(struct snapshot *snap) {
@@ -351,25 +482,208 @@ char* prepare_snapshot_details(struct snapshot *snap) {
     return details;
 }
 
+// Rollback to a specific snapshot
+void rollback_to_snapshot(size_t snapshot_id) {
+    printf("rollback_to_snapshot: Rolling back to snapshot ID %zu\n", snapshot_id);
+
+    // Find the snapshot
+    struct snapshot *snap = snapshots_list;
+    while (snap) {
+        if (snap->snapshot_id == snapshot_id) {
+            break;
+        }
+        snap = snap->next;
+    }
+    if (!snap) {
+        printf("rollback_to_snapshot: Snapshot ID %zu not found\n", snapshot_id);
+        return;
+    }
+
+    // First, free the current filesystem (excluding snapshots)
+    if (root) {
+        free_node(root);
+        initialize_root();
+    } else {
+        initialize_root();
+    }
+
+    // Now, restore files from the snapshot
+    struct file_snapshot *fsnap = snap->file_snapshots;
+    while (fsnap) {
+        // Create file nodes and restore versions
+        char *path = fsnap->path;
+        size_t version_number = fsnap->version_number;
+        printf("Restoring %s to version %zu\n", path, version_number);
+
+        // Create the file node hierarchy
+        char *path_copy = strdup(path);
+        if (!path_copy) {
+            perror("strdup");
+            fsnap = fsnap->next;
+            continue;
+        }
+
+        trim_slashes(path_copy);
+        char *token;
+        char *saveptr;
+        struct file_node *current = root;
+        token = strtok_r(path_copy, "/", &saveptr);
+        while (token != NULL) {
+            // Check if child exists
+            struct file_node *child = current->children;
+            // struct file_node *prev_child = NULL;
+            while (child) {
+                if (strcmp(child->name, token) == 0) {
+                    break;
+                }
+                // prev_child = child;
+                child = child->next;
+            }
+            if (!child) {
+                // Create new node
+                struct file_node *new_node = malloc(sizeof(struct file_node));
+                if (!new_node) {
+                    perror("malloc");
+                    break;
+                }
+                memset(new_node, 0, sizeof(struct file_node));
+                new_node->name = strdup(token);
+                new_node->mode = S_IFDIR | 0755;
+                new_node->uid = getuid();
+                new_node->gid = getgid();
+                clock_gettime(CLOCK_REALTIME, &new_node->atime);
+                new_node->mtime = new_node->atime;
+                new_node->ctime = new_node->atime;
+                new_node->is_directory = 1;
+                new_node->children = NULL;
+                new_node->next = current->children;
+                current->children = new_node;
+                current = new_node;
+            } else {
+                current = child;
+            }
+            token = strtok_r(NULL, "/", &saveptr);
+        }
+
+        // Now, current is the file node (we need to set it as a file)
+        if (current) {
+            current->is_directory = 0;
+            current->mode = S_IFREG | 0644;
+            current->current_version = version_number + 1; // Since version_number is the last saved version
+            current->versions = NULL;
+            current->content = NULL;
+            current->size = 0;
+            // Restore the file version
+            restore_file_version(current, version_number);
+        }
+
+        free(path_copy);
+        fsnap = fsnap->next;
+    }
+}
+
+// Restore a file node to a specific version
+void restore_file_version(struct file_node *node, size_t version_number) {
+    printf("restore_file_version: Restoring %s to version %zu\n", node->name, version_number);
+    // For this simulation, we cannot retrieve the actual content
+    // We'll simulate by setting dummy content
+    char content[256];
+    snprintf(content, sizeof(content), "Content of %s at version %zu\n", node->name, version_number);
+    size_t content_size = strlen(content);
+
+    node->content = malloc(content_size + 1);
+    if (!node->content) {
+        perror("malloc");
+        return;
+    }
+    strcpy(node->content, content);
+    node->size = content_size;
+    clock_gettime(CLOCK_REALTIME, &node->mtime);
+}
+
+char* generate_diff(size_t snapshot_id1, size_t snapshot_id2) {
+    printf("generate_diff: Generating diff between snapshots %zu and %zu\n", snapshot_id1, snapshot_id2);
+
+    // Find snapshots
+    struct snapshot *snap1 = NULL, *snap2 = NULL;
+    struct snapshot *snap = snapshots_list;
+    while (snap) {
+        if (snap->snapshot_id == snapshot_id1) {
+            snap1 = snap;
+        }
+        if (snap->snapshot_id == snapshot_id2) {
+            snap2 = snap;
+        }
+        snap = snap->next;
+    }
+    if (!snap1 || !snap2) {
+        return strdup("One or both snapshots not found.\n");
+    }
+
+    // Compare file lists and versions
+    char *diff_output = malloc(4096);
+    if (!diff_output) {
+        perror("malloc");
+        return NULL;
+    }
+    diff_output[0] = '\0';
+
+    strcat(diff_output, "Differences between snapshots:\n");
+
+    // Iterate over snap1's files
+    struct file_snapshot *fs1 = snap1->file_snapshots;
+    while (fs1) {
+        struct file_snapshot *fs2_curr = snap2->file_snapshots;
+        int found = 0;
+        while (fs2_curr) {
+            if (strcmp(fs1->path, fs2_curr->path) == 0) {
+                found = 1;
+                if (fs1->version_number != fs2_curr->version_number) {
+                    char line[256];
+                    snprintf(line, sizeof(line), "Modified: %s (version %zu -> %zu)\n", fs1->path, fs1->version_number, fs2_curr->version_number);
+                    strcat(diff_output, line);
+                }
+                break;
+            }
+            fs2_curr = fs2_curr->next;
+        }
+        if (!found) {
+            char line[256];
+            snprintf(line, sizeof(line), "Deleted: %s\n", fs1->path);
+            strcat(diff_output, line);
+        }
+        fs1 = fs1->next;
+    }
+
+    // Iterate over snap2's files to find added files
+    struct file_snapshot *fs2 = snap2->file_snapshots;
+    while (fs2) {
+        struct file_snapshot *fs1_curr = snap1->file_snapshots;
+        int found = 0;
+        while (fs1_curr) {
+            if (strcmp(fs2->path, fs1_curr->path) == 0) {
+                found =1;
+                break;
+            }
+            fs1_curr = fs1_curr->next;
+        }
+        if (!found) {
+            char line[256];
+            snprintf(line, sizeof(line), "Added: %s\n", fs2->path);
+            strcat(diff_output, line);
+        }
+        fs2 = fs2->next;
+    }
+
+    return diff_output;
+}
+
 // getattr callback
 static int simple_getattr(const char *path, struct stat *stbuf,
                           struct fuse_file_info *fi) {
     printf("getattr called for path: %s\n", path);
     (void) fi;
     memset(stbuf, 0, sizeof(struct stat));
-
-    // Handle special file .snapshot
-    if (is_special_file(path)) {
-        stbuf->st_mode = S_IFREG | 0222; // Write-only file
-        stbuf->st_nlink = 1;
-        stbuf->st_size = 0;
-        stbuf->st_uid = getuid();
-        stbuf->st_gid = getgid();
-        clock_gettime(CLOCK_REALTIME, &stbuf->st_atim);
-        stbuf->st_mtim = stbuf->st_atim;
-        stbuf->st_ctim = stbuf->st_atim;
-        return 0;
-    }
 
     // Handle .snapshots directory
     if (is_snapshots_dir(path)) {
@@ -384,36 +698,61 @@ static int simple_getattr(const char *path, struct stat *stbuf,
         return 0;
     }
 
-    // Handle files within .snapshots
+    // Handle snapshot files within .snapshots
     if (strncmp(path, "/.snapshots/", 12) == 0) {
-        const char *snap_id_str = path + 12;
-        char *endptr;
-        size_t snap_id = strtoul(snap_id_str, &endptr, 10);
-        if (*endptr == '\0') {
-            // It's a snapshot file
-            // Check if snapshot exists
-            struct snapshot *snap = snapshots_list;
-            while (snap) {
-                if (snap->snapshot_id == snap_id) {
-                    stbuf->st_mode = S_IFREG | 0444; // Read-only file
-                    stbuf->st_nlink = 1;
-                    // Calculate size of snapshot details
-                    char *details = prepare_snapshot_details(snap);
+        // Extract snapshot ID from the path
+        size_t snapshot_id = strtoul(path + 12, NULL, 10);
+        struct snapshot *snap = snapshots_list;
+        while (snap) {
+            if (snap->snapshot_id == snapshot_id) {
+                // Found the snapshot
+                stbuf->st_mode = S_IFREG | 0444; // Read-only file
+                stbuf->st_nlink = 1;
+                // Calculate size of snapshot details
+                char *details = prepare_snapshot_details(snap);
+                if (details) {
                     stbuf->st_size = strlen(details);
                     free(details);
-                    stbuf->st_uid = getuid();
-                    stbuf->st_gid = getgid();
-                    clock_gettime(CLOCK_REALTIME, &stbuf->st_atim);
-                    stbuf->st_mtim = stbuf->st_atim;
-                    stbuf->st_ctim = stbuf->st_atim;
-                    return 0;
+                } else {
+                    stbuf->st_size = 0;
                 }
-                snap = snap->next;
+                stbuf->st_uid = getuid();
+                stbuf->st_gid = getgid();
+                clock_gettime(CLOCK_REALTIME, &stbuf->st_atim);
+                stbuf->st_mtim = stbuf->st_atim;
+                stbuf->st_ctim = stbuf->st_atim;
+                return 0;
             }
-            // Snapshot not found
-            return -ENOENT;
+            snap = snap->next;
+        }
+        // Snapshot not found
+        return -ENOENT;
+    }
+
+    // Handle special files like .snapshot_create, .rollback, and .diff
+    if (is_special_file(path)) {
+        if (is_snapshot_create_file(path)) {
+            // .snapshot_create is a regular file with write permissions
+            stbuf->st_mode = S_IFREG | 0222; // Write-only
+            stbuf->st_nlink = 1;
+            stbuf->st_size = 0;
+            stbuf->st_uid = getuid();
+            stbuf->st_gid = getgid();
+            clock_gettime(CLOCK_REALTIME, &stbuf->st_atim);
+            stbuf->st_mtim = stbuf->st_atim;
+            stbuf->st_ctim = stbuf->st_atim;
+            return 0;
         } else {
-            return -ENOENT;
+            // Handle other special files like .rollback and .diff
+            stbuf->st_mode = S_IFREG | 0666; // Read-write file
+            stbuf->st_nlink = 1;
+            stbuf->st_size = 0;
+            stbuf->st_uid = getuid();
+            stbuf->st_gid = getgid();
+            clock_gettime(CLOCK_REALTIME, &stbuf->st_atim);
+            stbuf->st_mtim = stbuf->st_atim;
+            stbuf->st_ctim = stbuf->st_atim;
+            return 0;
         }
     }
 
@@ -517,19 +856,22 @@ static int simple_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
     // Include special entries if in root directory
     if (strcmp(path, "/") == 0) {
-        filler(buf, ".snapshot", NULL, 0, 0);
+        filler(buf, ".snapshot_create", NULL, 0, 0);
         filler(buf, ".snapshots", NULL, 0, 0);
+        filler(buf, ".rollback", NULL, 0, 0);
+        filler(buf, ".diffs", NULL, 0, 0);  // Changed from ".diff" to ".diffs"
     }
 
     return 0;
 }
+
 
 // access callback
 static int simple_access(const char *path, int mask) {
     printf("access called for path: %s, mask: %d\n", path, mask);
 
     // Handle special files
-    if (is_special_file(path) || is_snapshots_dir(path) || strncmp(path, "/.snapshots/", 12) == 0) {
+    if (is_special_file(path) || is_snapshots_dir(path) || is_rollback_file(path) || is_diff_file(path) || strncmp(path, "/.snapshots/", 12) == 0) {
         return 0;
     }
 
@@ -552,11 +894,11 @@ static int simple_mkdir(const char *path, mode_t mode) {
     printf("mkdir called for path: %s with mode: %o\n", path, mode);
 
     // Disallow creating special directories
-    if (is_special_file(path) || is_snapshots_dir(path)) {
+    if (is_special_file(path) || is_snapshots_dir(path) || is_rollback_file(path) || is_diff_file(path)) {
         return -EACCES;
     }
 
-    // Make copies of the path since dirname and basename may modify them
+    // Make copies of the path since we modify them
     char *path_copy = strdup(path);
     if (!path_copy) {
         perror("strdup");
@@ -565,14 +907,31 @@ static int simple_mkdir(const char *path, mode_t mode) {
 
     trim_slashes(path_copy);
 
-    char *parent_path = strdup(path_copy);
-    char *base_name = strrchr(parent_path, '/');
+    char *base_name = strrchr(path_copy, '/');
+    char *parent_path;
     if (base_name) {
         *base_name = '\0';
         base_name++;
+        parent_path = strdup(path_copy);
+        if (!parent_path) {
+            perror("strdup");
+            free(path_copy);
+            return -ENOMEM;
+        }
     } else {
-        base_name = parent_path;
+        base_name = strdup(path_copy);
+        if (!base_name) {
+            perror("strdup");
+            free(path_copy);
+            return -ENOMEM;
+        }
         parent_path = strdup("/");
+        if (!parent_path) {
+            perror("strdup");
+            free(path_copy);
+            free(base_name);
+            return -ENOMEM;
+        }
     }
 
     // Check if base_name is empty
@@ -580,6 +939,7 @@ static int simple_mkdir(const char *path, mode_t mode) {
         printf("mkdir: Invalid path (empty base name): %s\n", path);
         free(path_copy);
         free(parent_path);
+        free(base_name);
         return -EINVAL;
     }
 
@@ -590,6 +950,7 @@ static int simple_mkdir(const char *path, mode_t mode) {
         printf("mkdir: Parent directory does not exist: %s\n", parent_path);
         free(path_copy);
         free(parent_path);
+        free(base_name);
         return -ENOENT;
     }
 
@@ -600,6 +961,7 @@ static int simple_mkdir(const char *path, mode_t mode) {
             printf("mkdir: Directory already exists: %s\n", base_name);
             free(path_copy);
             free(parent_path);
+            free(base_name);
             return -EEXIST;
         }
         existing = existing->next;
@@ -610,6 +972,7 @@ static int simple_mkdir(const char *path, mode_t mode) {
         perror("malloc");
         free(path_copy);
         free(parent_path);
+        free(base_name);
         return -ENOMEM;
     }
     memset(new_dir, 0, sizeof(struct file_node));
@@ -619,6 +982,7 @@ static int simple_mkdir(const char *path, mode_t mode) {
         free(new_dir);
         free(path_copy);
         free(parent_path);
+        free(base_name);
         return -ENOMEM;
     }
 
@@ -637,20 +1001,22 @@ static int simple_mkdir(const char *path, mode_t mode) {
 
     free(path_copy);
     free(parent_path);
+    free(base_name);
 
     return 0;
 }
+
 
 // rmdir callback
 static int simple_rmdir(const char *path) {
     printf("rmdir called for path: %s\n", path);
 
     // Disallow removing special directories
-    if (is_special_file(path) || is_snapshots_dir(path)) {
+    if (is_special_file(path) || is_snapshots_dir(path) || is_rollback_file(path) || is_diff_file(path)) {
         return -EACCES;
     }
 
-    // Make copies of the path since dirname and basename may modify them
+    // Make copies of the path since we modify them
     char *path_copy = strdup(path);
     if (!path_copy) {
         perror("strdup");
@@ -716,15 +1082,88 @@ static int simple_rmdir(const char *path) {
 // create callback
 static int simple_create(const char *path, mode_t mode,
                          struct fuse_file_info *fi) {
-    printf("create called for path: %s with mode: %o\n", path, mode);
+     printf("create called for path: %s with mode: %o\n", path, mode);
     (void) fi;
 
+    // Check if creating a diff in .diffs directory
+    if (strncmp(path, "/.diffs/", 8) == 0) {
+        // Extract snapshot IDs from the filename
+        const char *diff_name = path + 8; // ".diffs/" is 8 chars
+        char *diff_name_copy = strdup(diff_name);
+        if (!diff_name_copy) {
+            perror("strdup");
+            return -ENOMEM;
+        }
+        char *underscore = strchr(diff_name_copy, '_');
+        if (!underscore) {
+            free(diff_name_copy);
+            return -EINVAL; // Invalid diff filename format
+        }
+        *underscore = '\0';
+        size_t snap_id1 = strtoul(diff_name_copy, NULL, 10);
+        size_t snap_id2 = strtoul(underscore + 1, NULL, 10);
+        free(diff_name_copy);
+
+        // Generate diff
+        char *diff_output = generate_diff(snap_id1, snap_id2);
+        if (!diff_output) {
+            return -EIO; // I/O error
+        }
+
+        // Create a file node with the diff content
+        struct file_node *parent = find_node("/.diffs");
+        if (!parent || !parent->is_directory) {
+            free(diff_output);
+            return -ENOENT;
+        }
+
+        // Check if file already exists
+        struct file_node *existing = parent->children;
+        while (existing != NULL) {
+            if (strcmp(existing->name, diff_name) == 0) {
+                free(diff_output);
+                return -EEXIST;
+            }
+            existing = existing->next;
+        }
+
+        struct file_node *new_diff = malloc(sizeof(struct file_node));
+        if (!new_diff) {
+            perror("malloc");
+            free(diff_output);
+            return -ENOMEM;
+        }
+        memset(new_diff, 0, sizeof(struct file_node));
+        new_diff->name = strdup(diff_name);
+        if (!new_diff->name) {
+            perror("strdup");
+            free(new_diff);
+            free(diff_output);
+            return -ENOMEM;
+        }
+
+        new_diff->mode = S_IFREG | 0444; // Read-only file
+        new_diff->uid = getuid();
+        new_diff->gid = getgid();
+        clock_gettime(CLOCK_REALTIME, &new_diff->atime);
+        new_diff->mtime = new_diff->atime;
+        new_diff->ctime = new_diff->atime;
+        new_diff->is_directory = 0;
+        new_diff->content = diff_output;
+        new_diff->size = strlen(diff_output);
+        new_diff->next = parent->children;
+        parent->children = new_diff;
+
+        printf("create: Created diff file: %s between snapshots %zu and %zu\n", diff_name, snap_id1, snap_id2);
+        return 0;
+    }
+
     // Disallow creating special files
-    if (is_special_file(path) || is_snapshots_dir(path)) {
+    if (is_special_file(path) || is_snapshots_dir(path) || is_rollback_file(path) || is_diff_file(path)) {
         return -EACCES;
     }
 
-    // Make copies of the path since dirname and basename may modify them
+    // Make copies of the path since we modify them
     char *path_copy = strdup(path);
     if (!path_copy) {
         perror("strdup");
@@ -799,6 +1238,8 @@ static int simple_create(const char *path, mode_t mode,
     new_file->is_directory = 0;
     new_file->content = NULL;
     new_file->size = 0;
+    new_file->current_version = 0;
+    new_file->versions = NULL;
     new_file->next = parent->children;
     parent->children = new_file;
 
@@ -815,11 +1256,11 @@ static int simple_unlink(const char *path) {
     printf("unlink called for path: %s\n", path);
 
     // Disallow removing special files
-    if (is_special_file(path) || is_snapshots_dir(path)) {
+    if (is_special_file(path) || is_snapshots_dir(path) || is_rollback_file(path) || is_diff_file(path)) {
         return -EACCES;
     }
 
-    // Make copies of the path since dirname and basename may modify them
+    // Make copies of the path since we modify them
     char *path_copy = strdup(path);
     if (!path_copy) {
         perror("strdup");
@@ -885,10 +1326,10 @@ static int simple_unlink(const char *path) {
 static int simple_open(const char *path, struct fuse_file_info *fi) {
     printf("open called for path: %s\n", path);
 
-    // Handle special file .snapshot
-    if (is_special_file(path)) {
-        // Allow write-only access
-        if ((fi->flags & O_ACCMODE) != O_WRONLY) {
+    // Handle special files
+    if (is_special_file(path) || is_rollback_file(path) || is_diff_file(path)) {
+        // Allow read-write access
+        if ((fi->flags & O_ACCMODE) != O_WRONLY && (fi->flags & O_ACCMODE) != O_RDONLY && (fi->flags & O_ACCMODE) != O_RDWR) {
             return -EACCES;
         }
         return 0;
@@ -917,6 +1358,24 @@ static int simple_read(const char *path, char *buf, size_t size, off_t offset,
     printf("read called for path: %s, size: %zu, offset: %ld\n", path, size, offset);
     (void) fi;
 
+    // Handle reading from .diffs directory
+    if (strncmp(path, "/.diffs/", 8) == 0) {
+        struct file_node *diff_file = find_node(path);
+        if (!diff_file || diff_file->is_directory) {
+            return -ENOENT;
+        }
+        if (!diff_file->content) {
+            return 0;
+        }
+        if (offset >= (off_t) diff_file->size) {
+            size = 0;
+        } else if (offset + size > diff_file->size) {
+            size = diff_file->size - offset;
+        }
+        memcpy(buf, diff_file->content + offset, size);
+        return size;
+    }
+
     // Handle reading snapshot metadata
     if (strncmp(path, "/.snapshots/", 12) == 0) {
         const char *snap_id_str = path + 12;
@@ -943,6 +1402,32 @@ static int simple_read(const char *path, char *buf, size_t size, off_t offset,
             snap = snap->next;
         }
         return -ENOENT;
+    }
+
+    // Handle reading from .diff
+    if (is_diff_file(path)) {
+        // For simplicity, we'll assume the user wants to compare the last two snapshots
+        if (snapshot_counter < 2) {
+            char *message = "Not enough snapshots to perform diff.\n";
+            size_t len = strlen(message);
+            if (offset >= (off_t) len) {
+                size = 0;
+            } else if (offset + size > len) {
+                size = len - offset;
+            }
+            memcpy(buf, message + offset, size);
+            return size;
+        }
+        char *diff_output = generate_diff(snapshot_counter - 2, snapshot_counter - 1);
+        size_t len = strlen(diff_output);
+        if (offset >= (off_t) len) {
+            size = 0;
+        } else if (offset + size > len) {
+            size = len - offset;
+        }
+        memcpy(buf, diff_output + offset, size);
+        free(diff_output);
+        return size;
     }
 
     // Versioning Logic
@@ -1012,18 +1497,40 @@ static int simple_read(const char *path, char *buf, size_t size, off_t offset,
 
 // write callback
 static int simple_write(const char *path, const char *buf, size_t size,
-                        off_t offset, struct fuse_file_info *fi) {
+                            off_t offset, struct fuse_file_info *fi) {
     printf("write called for path: %s, size: %zu, offset: %ld\n", path, size, offset);
     (void) fi;
 
-    // Handle special file .snapshot
-    if (is_special_file(path)) {
-        printf("write to .snapshot: Creating a new snapshot\n");
+    // Handle writing to .snapshot_create
+    if (is_snapshot_create_file(path)) {
+        printf("write to .snapshot_create: Creating a new snapshot\n");
         // Trigger snapshot creation
         create_snapshot();
         return size; // Indicate that all bytes were "written"
     }
 
+    // Handle writing to .rollback
+    if (is_rollback_file(path)) {
+        // Expecting a snapshot ID to rollback to
+        char *input = strndup(buf, size);
+        if (!input) {
+            perror("strndup");
+            return -ENOMEM;
+        }
+        size_t snapshot_id = strtoul(input, NULL, 10);
+        printf("write to .rollback: Rolling back to snapshot ID %zu\n", snapshot_id);
+        rollback_to_snapshot(snapshot_id);
+        free(input);
+        return size;
+    }
+
+    // Handle writing to .diff
+    if (is_diff_file(path)) {
+        // Implement if needed, currently no specific write handling
+        return size;
+    }
+
+    // Handle regular file write operations
     struct file_node *node = find_node(path);
     if (node == NULL) {
         printf("write: No such file: %s\n", path);
@@ -1042,7 +1549,7 @@ static int simple_write(const char *path, const char *buf, size_t size,
         return -ENOMEM;
     }
     new_version->version_number = node->current_version++;
-    new_version->timestamp = node->mtime;  // Use current modification time
+    clock_gettime(CLOCK_REALTIME, &new_version->timestamp);
     new_version->size = node->size;
     if (node->content && node->size > 0) {
         new_version->content = malloc(node->size);
@@ -1062,7 +1569,7 @@ static int simple_write(const char *path, const char *buf, size_t size,
     // Adjust content size and reallocate if necessary
     if (offset + size > node->size) {
         char *new_content = realloc(node->content, offset + size);
-        if (!new_content) {
+        if (!new_content && size != 0) {
             perror("realloc");
             return -ENOMEM;
         }
@@ -1095,6 +1602,7 @@ static int simple_write(const char *path, const char *buf, size_t size,
 
     return size;
 }
+
 
 // truncate callback
 static int simple_truncate(const char *path, off_t size,
@@ -1193,6 +1701,22 @@ static int simple_statfs(const char *path, struct statvfs *stbuf) {
     return 0;
 }
 
+// FLUSH callback
+static int simple_flush(const char *path, struct fuse_file_info *fi) {
+    printf("flush called for path: %s\n", path);
+    (void) fi;
+    // Since we are not managing file handles, do nothing
+    return 0;
+}
+
+// GETXATTR callback
+static int simple_getxattr(const char *path, const char *name, char *value, size_t size) {
+    printf("getxattr called for path: %s, name: %s\n", path, name);
+    // Xattr not supported
+    return -ENODATA;
+}
+
+
 // fuse_operations structure
 static const struct fuse_operations simple_oper = {
     .getattr    = simple_getattr,
@@ -1211,6 +1735,8 @@ static const struct fuse_operations simple_oper = {
     .destroy    = destroy_fs,  // Cleanup callback
     .access     = simple_access,
     .statfs     = simple_statfs,
+    .flush      = simple_flush,   // Added
+    .getxattr   = simple_getxattr
 };
 
 int main(int argc, char *argv[]) {
