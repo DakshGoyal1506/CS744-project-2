@@ -98,22 +98,8 @@ static bool is_snapshot_create_file(const char *path) {
 
 // Update is_special_file to include .snapshot_create instead of .snapshot
 static bool is_special_file(const char *path) {
-    return is_snapshot_create_file(path) || is_rollback_file(path) || is_diff_file(path);
+    return is_snapshot_create_file(path) || is_rollback_file(path);
 }
-
-// // Helper functions to check special files // old function was used to check .snapshot
-// static bool is_special_file(const char *path) {
-//     // Normalize path to remove trailing slashes
-//     size_t len = strlen(path);
-//     while (len > 1 && path[len - 1] == '/') {
-//         len--;
-//     }
-//     char normalized_path[len + 1];
-//     strncpy(normalized_path, path, len);
-//     normalized_path[len] = '\0';
-
-//     return strcmp(normalized_path, "/.snapshot") == 0;
-// }
 
 static bool is_snapshots_dir(const char *path) {
     // Normalize path to remove trailing slashes
@@ -141,6 +127,7 @@ static bool is_rollback_file(const char *path) {
 }
 
 static bool is_diff_file(const char *path) {
+    // Normalize path to remove trailing slashes
     size_t len = strlen(path);
     while (len > 1 && path[len -1] == '/') {
         len--;
@@ -149,7 +136,8 @@ static bool is_diff_file(const char *path) {
     strncpy(normalized_path, path, len);
     normalized_path[len] = '\0';
 
-    return strcmp(normalized_path, "/.diff") == 0;
+    // Check if path is "/.diffs" or starts with "/.diffs/"
+    return strcmp(normalized_path, "/.diffs") == 0 || strncmp(normalized_path, "/.diffs/", 8) == 0;
 }
 
 // Initialize the root node of the filesystem
@@ -405,11 +393,12 @@ void record_file_versions(struct file_node *node, const char *path_prefix,
 
     char *current_path = NULL;
     if (strcmp(path_prefix, "") == 0) {
-        // Avoid double slashes by omitting the first slash if root's name is empty
-        asprintf(&current_path, "/%s", node->name[0] ? node->name : "");
-    } else if (strcmp(node->name, "") == 0) {
-        // Handle root or unnamed nodes
-        asprintf(&current_path, "%s", path_prefix);
+        // Root directory
+        if (strcmp(node->name, "") == 0) {
+            current_path = strdup("/");
+        } else {
+            asprintf(&current_path, "/%s", node->name);
+        }
     } else {
         asprintf(&current_path, "%s/%s", path_prefix, node->name);
     }
@@ -445,7 +434,7 @@ void record_file_versions(struct file_node *node, const char *path_prefix,
     }
 
     free(current_path);
-}s
+}
 
 // Prepare a string containing snapshot details
 char* prepare_snapshot_details(struct snapshot *snap) {
@@ -585,20 +574,36 @@ void rollback_to_snapshot(size_t snapshot_id) {
 // Restore a file node to a specific version
 void restore_file_version(struct file_node *node, size_t version_number) {
     printf("restore_file_version: Restoring %s to version %zu\n", node->name, version_number);
-    // For this simulation, we cannot retrieve the actual content
-    // We'll simulate by setting dummy content
-    char content[256];
-    snprintf(content, sizeof(content), "Content of %s at version %zu\n", node->name, version_number);
-    size_t content_size = strlen(content);
 
-    node->content = malloc(content_size + 1);
-    if (!node->content) {
-        perror("malloc");
-        return;
+    // Find the specified version in the node's versions
+    struct file_version *ver = node->versions;
+    while (ver) {
+        if (ver->version_number == version_number) {
+            // Free the current content
+            free(node->content);
+            // Restore content from version
+            if (ver->content && ver->size > 0) {
+                node->content = malloc(ver->size);
+                if (!node->content) {
+                    perror("malloc");
+                    node->content = NULL;
+                    node->size = 0;
+                    return;
+                }
+                memcpy(node->content, ver->content, ver->size);
+                node->size = ver->size;
+            } else {
+                node->content = NULL;
+                node->size = 0;
+            }
+            clock_gettime(CLOCK_REALTIME, &node->mtime);
+            return;
+        }
+        ver = ver->next;
     }
-    strcpy(node->content, content);
-    node->size = content_size;
-    clock_gettime(CLOCK_REALTIME, &node->mtime);
+
+    // If version not found, do nothing
+    printf("restore_file_version: Version %zu not found for %s\n", version_number, node->name);
 }
 
 char* generate_diff(size_t snapshot_id1, size_t snapshot_id2) {
@@ -620,8 +625,9 @@ char* generate_diff(size_t snapshot_id1, size_t snapshot_id2) {
         return strdup("One or both snapshots not found.\n");
     }
 
-    // Compare file lists and versions
-    char *diff_output = malloc(4096);
+    // Use a dynamic string to build the diff output
+    size_t buffer_size = 1024;
+    char *diff_output = malloc(buffer_size);
     if (!diff_output) {
         perror("malloc");
         return NULL;
@@ -629,6 +635,25 @@ char* generate_diff(size_t snapshot_id1, size_t snapshot_id2) {
     diff_output[0] = '\0';
 
     strcat(diff_output, "Differences between snapshots:\n");
+
+    // Helper function to append text to diff_output
+    void append_to_diff(const char *text) {
+        size_t new_len = strlen(diff_output) + strlen(text) + 1;
+        if (new_len > buffer_size) {
+            buffer_size *= 2;
+            diff_output = realloc(diff_output, buffer_size);
+            if (!diff_output) {
+                perror("realloc");
+                diff_output = NULL;
+                return;
+            }
+        }
+        strcat(diff_output, text);
+    }
+
+    if (!diff_output) {
+        return NULL;
+    }
 
     // Iterate over snap1's files
     struct file_snapshot *fs1 = snap1->file_snapshots;
@@ -641,7 +666,8 @@ char* generate_diff(size_t snapshot_id1, size_t snapshot_id2) {
                 if (fs1->version_number != fs2_curr->version_number) {
                     char line[256];
                     snprintf(line, sizeof(line), "Modified: %s (version %zu -> %zu)\n", fs1->path, fs1->version_number, fs2_curr->version_number);
-                    strcat(diff_output, line);
+                    append_to_diff(line);
+                    if (!diff_output) return NULL; // realloc failed
                 }
                 break;
             }
@@ -650,7 +676,8 @@ char* generate_diff(size_t snapshot_id1, size_t snapshot_id2) {
         if (!found) {
             char line[256];
             snprintf(line, sizeof(line), "Deleted: %s\n", fs1->path);
-            strcat(diff_output, line);
+            append_to_diff(line);
+            if (!diff_output) return NULL; // realloc failed
         }
         fs1 = fs1->next;
     }
@@ -670,7 +697,8 @@ char* generate_diff(size_t snapshot_id1, size_t snapshot_id2) {
         if (!found) {
             char line[256];
             snprintf(line, sizeof(line), "Added: %s\n", fs2->path);
-            strcat(diff_output, line);
+            append_to_diff(line);
+            if (!diff_output) return NULL; // realloc failed
         }
         fs2 = fs2->next;
     }
@@ -1326,8 +1354,8 @@ static int simple_unlink(const char *path) {
 static int simple_open(const char *path, struct fuse_file_info *fi) {
     printf("open called for path: %s\n", path);
 
-    // Handle special files
-    if (is_special_file(path) || is_rollback_file(path) || is_diff_file(path)) {
+    // Handle special control files
+    if (is_special_file(path)) {
         // Allow read-write access
         if ((fi->flags & O_ACCMODE) != O_WRONLY && (fi->flags & O_ACCMODE) != O_RDONLY && (fi->flags & O_ACCMODE) != O_RDWR) {
             return -EACCES;
@@ -1343,6 +1371,14 @@ static int simple_open(const char *path, struct fuse_file_info *fi) {
         return 0;
     }
 
+    // Files within .diffs are read-only
+    if (strncmp(path, "/.diffs/", 8) == 0) {
+        if ((fi->flags & O_ACCMODE) != O_RDONLY) {
+            return -EACCES;
+        }
+        return 0;
+    }
+
     struct file_node *node = find_node(path);
     if (node == NULL || node->is_directory) {
         printf("open: No such file: %s\n", path);
@@ -1351,6 +1387,7 @@ static int simple_open(const char *path, struct fuse_file_info *fi) {
     // For simplicity, no file handles are managed
     return 0;
 }
+
 
 // read callback
 static int simple_read(const char *path, char *buf, size_t size, off_t offset,
@@ -1402,32 +1439,6 @@ static int simple_read(const char *path, char *buf, size_t size, off_t offset,
             snap = snap->next;
         }
         return -ENOENT;
-    }
-
-    // Handle reading from .diff
-    if (is_diff_file(path)) {
-        // For simplicity, we'll assume the user wants to compare the last two snapshots
-        if (snapshot_counter < 2) {
-            char *message = "Not enough snapshots to perform diff.\n";
-            size_t len = strlen(message);
-            if (offset >= (off_t) len) {
-                size = 0;
-            } else if (offset + size > len) {
-                size = len - offset;
-            }
-            memcpy(buf, message + offset, size);
-            return size;
-        }
-        char *diff_output = generate_diff(snapshot_counter - 2, snapshot_counter - 1);
-        size_t len = strlen(diff_output);
-        if (offset >= (off_t) len) {
-            size = 0;
-        } else if (offset + size > len) {
-            size = len - offset;
-        }
-        memcpy(buf, diff_output + offset, size);
-        free(diff_output);
-        return size;
     }
 
     // Versioning Logic
@@ -1521,12 +1532,6 @@ static int simple_write(const char *path, const char *buf, size_t size,
         printf("write to .rollback: Rolling back to snapshot ID %zu\n", snapshot_id);
         rollback_to_snapshot(snapshot_id);
         free(input);
-        return size;
-    }
-
-    // Handle writing to .diff
-    if (is_diff_file(path)) {
-        // Implement if needed, currently no specific write handling
         return size;
     }
 
@@ -1738,7 +1743,6 @@ static const struct fuse_operations simple_oper = {
     .flush      = simple_flush,   // Added
     .getxattr   = simple_getxattr
 };
-
 int main(int argc, char *argv[]) {
     initialize_root();
     printf("Starting FUSE filesystem...\n");
